@@ -146,9 +146,11 @@ class AssortativeMatingSimulation:
                  # h2_targets removed per request
                  num_generations=None, pop_size=None, mating_type="phenotypic", avoid_inbreeding=True,
                  save_each_gen=True, save_covs=True, seed=0,
-                 output_summary_filename=None, 
+                 output_summary_filename=None,
                  summary_file_scope="final",
                  n_burn_in=0,
+                 compute_raw_h2=False,
+                 raw_h2_generations=None,
                  cove_mat=None, 
                  f_mat=None, 
                  s_mat=None, 
@@ -212,6 +214,18 @@ class AssortativeMatingSimulation:
         self.avoid_inbreeding = avoid_inbreeding; self.save_each_gen = save_each_gen; self.save_covs = save_covs
         self.seed = int(seed); self.output_summary_filename = output_summary_filename; self.summary_file_scope = summary_file_scope
         self.n_burn_in = int(n_burn_in)
+        self.compute_raw_h2 = bool(compute_raw_h2)
+        # Which main-phase generation(s) (1-based, matching the 'GEN' summary field) to
+        # compute raw h2 for. None (default) -> last generation only. 'all' -> every
+        # recorded generation. Otherwise an int or iterable of ints.
+        if raw_h2_generations is None:
+            self._raw_h2_gens = {self.num_generations}
+        elif isinstance(raw_h2_generations, str) and raw_h2_generations.lower() == 'all':
+            self._raw_h2_gens = None
+        elif isinstance(raw_h2_generations, (int, np.integer)):
+            self._raw_h2_gens = {int(raw_h2_generations)}
+        else:
+            self._raw_h2_gens = {int(g) for g in raw_h2_generations}
         
         if self.seed != 0: np.random.seed(self.seed)
 
@@ -354,6 +368,32 @@ class AssortativeMatingSimulation:
             m_full['Spouse.ID'] = f_full['ID']; f_full['Spouse.ID'] = m_full['ID']
             
         return {'males.PHENDATA': m_full, 'females.PHENDATA': f_full, 'achieved_spousal_corr': np.eye(2)}
+
+    def _compute_raw_heritability(self):
+        """
+        "Raw" realized heritability: R^2 from regressing phenotype on all
+        causal-variant genotypes at once (observed + latent SNPs together,
+        i.e. self.xo, which holds the full genotype pool regardless of the
+        observed/latent mask). This mirrors what an external GWAS-based h2
+        estimate (e.g. GREML/LDSC on the true causal variants) would recover,
+        as opposed to the analytic h2 computed from known variance components,
+        and is meant for calibrating the simulation against real-life h2.
+        """
+        X = self.xo.astype(float)
+        n = X.shape[0]
+        X_design = np.column_stack([np.ones(n), X])
+        h2_raw = []
+        for trait_col in ['Y1', 'Y2']:
+            y = self.phen_df[trait_col].values.astype(float)
+            ss_tot = np.sum((y - y.mean()) ** 2)
+            if ss_tot <= 0:
+                h2_raw.append(np.nan)
+                continue
+            coef, *_ = np.linalg.lstsq(X_design, y, rcond=None)
+            y_pred = X_design @ coef
+            ss_res = np.sum((y - y_pred) ** 2)
+            h2_raw.append(1 - ss_res / ss_tot)
+        return h2_raw
 
     def _calculate_genetic_values_masked(self, xo_matrix):
         """
@@ -625,6 +665,10 @@ class AssortativeMatingSimulation:
             summary_this_gen['h2.lat'] = (val_diag / vp_diag).tolist()
             summary_this_gen['h2.mt']  = (vmt_diag / vp_diag).tolist()
 
+        if self.compute_raw_h2 and (self._raw_h2_gens is None or r_gen_num in self._raw_h2_gens):
+            print(f"Generation {display_num}: Computing raw (regression-based) heritability...")
+            summary_this_gen['h2.raw'] = self._compute_raw_heritability()
+
         self.summary_results.append(summary_this_gen)
         if self.save_each_gen:
             self.history['MATES'].append(mates)
@@ -648,7 +692,9 @@ class AssortativeMatingSimulation:
         for key in ['VAO', 'VAL', 'VF', 'VMT', 'VE', 'VP']:
             s.append(f"  {key}: {self._format_matrix_for_file(gen_summary_dict.get(key, 'N/A'))}")
         s.append("\nHeritabilities:")
-        for key in ['h2', 'h2.obs', 'h2.lat', 'h2.mt']:
+        for key in ['h2', 'h2.obs', 'h2.lat', 'h2.mt', 'h2.raw']:
+            if key not in gen_summary_dict:
+                continue
             val = gen_summary_dict.get(key, ['N/A', 'N/A'])
             val1_str = f"{val[0]:.4f}" if isinstance(val[0], (float, np.floating)) else str(val[0])
             val2_str = f"{val[1]:.4f}" if isinstance(val[1], (float, np.floating)) else str(val[1])
