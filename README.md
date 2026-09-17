@@ -205,7 +205,7 @@ from core_simulation import AssortativeMatingSimulation
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `mating_type` | str | `"phenotypic"` | `"phenotypic"`, `"social"`, or `"genotypic"` |
+| `mating_type` | str or (str, str) | `"phenotypic"` | `"phenotypic"` (mate on `Y`), `"social"` (mate on `F + E`), or `"genotypic"` (mate on `AO + AL`). A `(trait1, trait2)` pair assorts each trait on a different component, e.g. `("genotypic", "social")` |
 | `avoid_inbreeding` | bool | `True` | Exclude first-degree relatives from pairing |
 | `am_list` | list | required | Per-generation assortative mating target. If `mate_on_trait` is set: list of floats (scalar correlation). If not set: list of 2×2 numpy arrays (cross-trait mating correlation matrix). Length must equal `num_generations` |
 | `mate_on_trait` | int or None | `None` | `1` or `2` = single-trait AM mode (scalar `am_list`). `None` = two-trait AM mode (matrix `am_list`) |

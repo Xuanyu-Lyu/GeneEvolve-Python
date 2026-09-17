@@ -298,23 +298,22 @@ class AssortativeMatingSimulation:
         final = np.full(n_targets, -1, dtype=int); final = new_closest_indices[np.argsort(rand_index_cols)]
         return final
 
+    _MATING_SOURCES = {"phenotypic": ("Y{i}",), "social": ("F{i}", "E{i}"), "genotypic": ("AO{i}", "AL{i}")}
+
     def _assort_mate(self, phendata_df_current_gen, mating_type, pheno_mate_corr_target_xsim_mu, pop_size_target_offspring):
-        # [Unchanged mating logic]
+        # mating_type: one string applied to both traits, or a (trait1, trait2) pair for per-trait assortment
         ancestor_id_cols = ['Father.ID', 'Mother.ID', 'Fathers.Father.ID', 'Fathers.Mother.ID', 'Mothers.Father.ID', 'Mothers.Mother.ID']
-        if mating_type == "phenotypic": cols = ["ID", "Sex", "Y1", "Y2"] + ancestor_id_cols
-        elif mating_type == "social": cols = ["ID", "Sex", "F1", "F2", "E1", "E2"] + ancestor_id_cols
-        elif mating_type == "genotypic": cols = ["ID", "Sex", "AO1", "AO2", "AL1", "AL2"] + ancestor_id_cols
-        else: raise ValueError(f"Invalid mating_type: {mating_type}")
-        
+        per_trait = tuple(mating_type) if isinstance(mating_type, (tuple, list)) else (mating_type, mating_type)
+        if len(per_trait) != 2 or any(t not in self._MATING_SOURCES for t in per_trait):
+            raise ValueError(f"Invalid mating_type: {mating_type}")
+        trait_cols = [c.format(i=i) for i, t in zip((1, 2), per_trait) for c in self._MATING_SOURCES[t]]
+        cols = ["ID", "Sex"] + trait_cols + ancestor_id_cols
+
         males_slim = phendata_df_current_gen.loc[phendata_df_current_gen["Sex"]==1, cols].copy()
         females_slim = phendata_df_current_gen.loc[phendata_df_current_gen["Sex"]==0, cols].copy()
-        if mating_type == "phenotypic":
-            males_slim.rename(columns={"Y1": "mating1", "Y2": "mating2"}, inplace=True)
-            females_slim.rename(columns={"Y1": "mating1", "Y2": "mating2"}, inplace=True)
-        elif mating_type == "social":
-            for df in [males_slim, females_slim]: df["mating1"] = df["F1"] + df["E1"]; df["mating2"] = df["F2"] + df["E2"]
-        elif mating_type == "genotypic":
-            for df in [males_slim, females_slim]: df["mating1"] = df["AO1"] + df["AL1"]; df["mating2"] = df["AO2"] + df["AL2"]
+        for df in [males_slim, females_slim]:
+            for i, t in zip((1, 2), per_trait):
+                df[f"mating{i}"] = sum(df[c.format(i=i)].astype(float) for c in self._MATING_SOURCES[t])
 
         nm, nf = len(males_slim), len(females_slim)
         if nm > nf: males_slim = males_slim.sample(n=nf, replace=False)
