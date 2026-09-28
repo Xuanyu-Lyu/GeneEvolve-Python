@@ -214,6 +214,11 @@ class IslandMigrationSimulation(AssortativeMatingSimulation):
                 f"pop_size ({_ps}) must be divisible by n_islands*2 "
                 f"({n_islands}*2={n_islands*2})."
             )
+        if base_kwargs.get('mating_paths') is not None:
+            raise NotImplementedError(
+                "mating_paths (latent mating phenotype) is not supported by "
+                "IslandMigrationSimulation; within-island mating is always on Y."
+            )
 
         # ---- island config ----
         self.n_islands = int(n_islands)

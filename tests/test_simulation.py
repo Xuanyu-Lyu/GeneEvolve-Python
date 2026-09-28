@@ -14,6 +14,12 @@ IslandMigrationSimulation, covering:
      burn-in, population has had time to evolve
   6. Edge cases — mt_mat off-diagonal raises ValueError; pop_size
      not divisible by n_islands*2 raises ValueError
+  7. mating_paths — weights equal to a mating_type preset reproduce
+     that preset exactly
+  8. Latent mating phenotype — genetic homogamy (AO + AL) and social
+     homogamy (F + E) assort on the intended components only
+  9. mating_paths validation — bad weights raise ValueError; islands
+     reject mating_paths
 
 Run with (from the SimulationFunctions/ directory):
     python tests/test_simulation.py
@@ -528,6 +534,145 @@ def test_reproducibility():
 
 
 # ===========================================================================
+# Test 7 — mating_paths reproduces the mating_type presets exactly
+# ===========================================================================
+
+def test_mating_paths_presets():
+    print("\n=== Test 7: mating_paths reproduces mating_type presets ===")
+    mats = _base_matrices()
+    mats['f_mat'] = np.diag([0.2, 0.2])   # non-zero F so the social composite uses it
+
+    np.random.seed(0)
+    cv_df = AssortativeMatingSimulation.prepare_CV_random_selection(
+        n_CV=300, rg_effects=0.3,
+        maf_min=0.01, maf_max=0.50,
+        prop_h2_obs_1=0.6, prop_h2_obs_2=0.6,
+    )
+    base = dict(
+        cv_info=cv_df,
+        num_generations=2, pop_size=1000,
+        mate_on_trait=1,
+        am_list=[0.4, 0.4],
+        seed=5,
+        **mats,
+    )
+    for preset, paths in [("genotypic", {"AO": 1, "AL": 1}),
+                          ("social",    {"F": 1, "E": 1})]:
+        y_type = AssortativeMatingSimulation(mating_type=preset, **base).run_simulation()['PHEN'][['Y1', 'Y2']].astype(float).values
+        y_paths = AssortativeMatingSimulation(mating_paths=paths, **base).run_simulation()['PHEN'][['Y1', 'Y2']].astype(float).values
+        _check(f"mating_paths={paths} gives identical results to mating_type='{preset}'",
+               y_type.shape == y_paths.shape and np.array_equal(y_type, y_paths))
+
+
+# ===========================================================================
+# Test 8 — Latent mating phenotype: genetic and social homogamy
+# ===========================================================================
+
+def _spousal_corr(mates, col):
+    """Correlation between husbands' and wives' values of `col` in one mates dict."""
+    m = mates['males.PHENDATA'][col].astype(float).values
+    f = mates['females.PHENDATA'][col].astype(float).values
+    return np.corrcoef(m, f)[0, 1]
+
+
+def test_latent_mating_phenotype():
+    print("\n=== Test 8: Latent mating phenotype (genetic / social homogamy) ===")
+    AM = 0.4
+    N = 6000
+    N_GEN = 4
+
+    # Genetic homogamy: mates assort on AO + AL only, with VT active
+    mats = _base_matrices(h2_1=0.5, h2_2=0.4)
+    mats['a_mat'] = np.diag([np.sqrt(0.2), np.sqrt(0.15)])
+    mats['d_mat'] = np.diag([np.sqrt(0.3), np.sqrt(0.25)])
+    mats['f_mat'] = np.diag([0.15, 0.15])
+    sim = AssortativeMatingSimulation(
+        n_CV=500, rg_effects=0.3,
+        maf_min=0.01, maf_max=0.50,
+        num_generations=N_GEN, pop_size=N,
+        mate_on_trait=1,
+        mating_paths={"AO": 1, "AL": 1},
+        am_list=[AM] * N_GEN,
+        seed=11,
+        **mats,
+    )
+    res = sim.run_simulation()
+    mates = res['HISTORY']['MATES'][-1]
+    r_gamma = mates['achieved_spousal_corr'][0, 0]
+    _check("Genetic homogamy: mates frames carry mating.phenotype1/2",
+           all(c in mates['males.PHENDATA'].columns for c in ['mating.phenotype1', 'mating.phenotype2']))
+    _check("Genetic homogamy: mating.phenotype1 equals AO1 + AL1",
+           np.allclose(mates['males.PHENDATA']['mating.phenotype1'].astype(float),
+                       mates['males.PHENDATA'][['AO1', 'AL1']].astype(float).sum(axis=1)))
+    _check(f"Genetic homogamy: spousal corr of mating phenotype ≈ {AM}",
+           abs(r_gamma - AM) < 0.05, f"r = {r_gamma:.4f}")
+    r_e = _spousal_corr(mates, 'E1')
+    _check("Genetic homogamy: spousal corr of E1 ≈ 0 (E not in mating phenotype)",
+           abs(r_e) < 0.05, f"r(E1) = {r_e:.4f}")
+    r_y = _spousal_corr(mates, 'Y1')
+    _check("Genetic homogamy: spousal corr of Y1 attenuated relative to mating phenotype",
+           0 < r_y < r_gamma, f"r(Y1) = {r_y:.4f}, r(gamma) = {r_gamma:.4f}")
+
+    # Social homogamy without VT: mating phenotype = E, so no genetic assortment
+    mats = _base_matrices(h2_1=0.5, h2_2=0.4)
+    sim = AssortativeMatingSimulation(
+        n_CV=500, rg_effects=0.3,
+        maf_min=0.01, maf_max=0.50,
+        num_generations=N_GEN, pop_size=N,
+        mate_on_trait=1,
+        mating_paths={"F": 1, "E": 1},
+        am_list=[AM] * N_GEN,
+        seed=12,
+        **mats,
+    )
+    mates = sim.run_simulation()['HISTORY']['MATES'][-1]
+    r_e = _spousal_corr(mates, 'E1')
+    _check(f"Social homogamy: spousal corr of E1 ≈ {AM}",
+           abs(r_e - AM) < 0.05, f"r(E1) = {r_e:.4f}")
+    for df in (mates['males.PHENDATA'], mates['females.PHENDATA']):
+        df['G1'] = df['AO1'].astype(float) + df['AL1'].astype(float)
+    r_g = _spousal_corr(mates, 'G1')
+    _check("Social homogamy: spousal corr of AO1 + AL1 ≈ 0",
+           abs(r_g) < 0.05, f"r(G1) = {r_g:.4f}")
+
+
+# ===========================================================================
+# Test 9 — mating_paths validation
+# ===========================================================================
+
+def test_mating_paths_validation():
+    print("\n=== Test 9: mating_paths validation ===")
+    common = dict(
+        n_CV=100, rg_effects=0.3,
+        maf_min=0.01, maf_max=0.50,
+        num_generations=1, pop_size=200,
+        mate_on_trait=1,
+        am_list=[0.4],
+        seed=0,
+        **_base_matrices(),
+    )
+    for label, paths in [("unknown component", {"AO": 1, "S": 1}),
+                         ("all-zero weights", {"AO": 0, "E": 0}),
+                         ("wrong number of traits", ({"AO": 1}, {"AO": 1}, {"AO": 1}))]:
+        try:
+            AssortativeMatingSimulation(mating_paths=paths, **common)
+            _check(f"mating_paths with {label} raises ValueError", False, "No error raised")
+        except ValueError as e:
+            _check(f"mating_paths with {label} raises ValueError", True, str(e))
+
+    try:
+        IslandMigrationSimulation(
+            n_islands=2, move_p=0.1, within_island_am=0.4,
+            migration_trait=2, mating_trait=1,
+            mating_paths={"AO": 1, "AL": 1},
+            **{k: v for k, v in common.items() if k != 'mate_on_trait'},
+        )
+        _check("IslandMigrationSimulation rejects mating_paths", False, "No error raised")
+    except NotImplementedError as e:
+        _check("IslandMigrationSimulation rejects mating_paths", True, str(e))
+
+
+# ===========================================================================
 # Entry point
 # ===========================================================================
 
@@ -539,6 +684,9 @@ def main():
         test_island_plus_mtdna,
         test_burn_in_base,
         test_reproducibility,
+        test_mating_paths_presets,
+        test_latent_mating_phenotype,
+        test_mating_paths_validation,
     ]
 
     for t in tests:

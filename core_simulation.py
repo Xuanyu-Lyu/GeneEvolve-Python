@@ -157,7 +157,8 @@ class AssortativeMatingSimulation:
                  a_mat=None, 
                  d_mat=None, 
                  am_list=None, mate_on_trait=None, covy_mat=None, k2_matrix=None,
-                 mt_mat=None):
+                 mt_mat=None,
+                 mating_paths=None):
 
         # --- CV GENERATION ---
         if cv_info is not None:
@@ -207,7 +208,10 @@ class AssortativeMatingSimulation:
         for param_name, param_val in essential_params.items():
             if param_val is None: raise ValueError(f"Parameter '{param_name}' must be provided.")
             
-        self.mating_type = mating_type 
+        self.mating_type = mating_type
+        # Latent mating phenotype weights (Cascade AM). None -> use the mating_type preset.
+        self.mating_paths = mating_paths
+        self._mating_weights = self._resolve_mating_paths(mating_paths) if mating_paths is not None else None
         self.num_generations = int(num_generations)
         self.initial_pop_size = int(pop_size) if isinstance(pop_size, (int, float)) else int(pop_size[0])
         self.pop_vector = np.array(pop_size, dtype=int) if isinstance(pop_size, (list, np.ndarray)) else np.full(self.num_generations, int(pop_size), dtype=int)
@@ -298,22 +302,56 @@ class AssortativeMatingSimulation:
         final = np.full(n_targets, -1, dtype=int); final = new_closest_indices[np.argsort(rand_index_cols)]
         return final
 
-    _MATING_SOURCES = {"phenotypic": ("Y{i}",), "social": ("F{i}", "E{i}"), "genotypic": ("AO{i}", "AL{i}")}
+    # Latent mating phenotype (GeneEvolve am.model; Cascade model gamma~): trait i's mating phenotype is
+    # sum_c w_c * C_i over that trait's own components C_i (AO, AL, F, MT, E), each already on the Y scale,
+    # so w_c = 1 means the component enters mate choice exactly as it enters Y and w_c = 0 means not at all.
+    # Presets reproduce the fixed composites; "phenotypic" uses Y itself (= all components with weight 1).
+    _MATING_PRESETS = {"phenotypic": {"Y": 1.0}, "social": {"F": 1.0, "E": 1.0}, "genotypic": {"AO": 1.0, "AL": 1.0}}
+    _MATING_COMPONENTS = ("AO", "AL", "F", "MT", "E")
+
+    @classmethod
+    def _resolve_mating_paths(cls, spec):
+        """Turn a mating spec into per-trait {component: weight} dicts.
+
+        spec: a preset name, a dict of component weights (applied to both traits),
+        or a (trait1, trait2) pair whose entries are either.
+        """
+        per_trait = tuple(spec) if isinstance(spec, (tuple, list)) else (spec, spec)
+        if len(per_trait) != 2:
+            raise ValueError(f"Invalid mating spec (need one entry per trait): {spec}")
+        resolved = []
+        for s in per_trait:
+            if isinstance(s, str):
+                if s not in cls._MATING_PRESETS:
+                    raise ValueError(f"Invalid mating_type: {spec}")
+                resolved.append(dict(cls._MATING_PRESETS[s]))
+            elif isinstance(s, dict):
+                unknown = set(s) - set(cls._MATING_COMPONENTS)
+                if unknown:
+                    raise ValueError(f"Unknown mating_paths component(s) {sorted(unknown)}; allowed: {list(cls._MATING_COMPONENTS)}")
+                weights = {c: float(s[c]) for c in cls._MATING_COMPONENTS if c in s and float(s[c]) != 0.0}
+                if not weights:
+                    raise ValueError(f"mating_paths weights are all zero for a trait ({s}); the mating phenotype would have no variance.")
+                resolved.append(weights)
+            else:
+                raise ValueError(f"Invalid mating spec entry: {s!r}")
+        return tuple(resolved)
 
     def _assort_mate(self, phendata_df_current_gen, mating_type, pheno_mate_corr_target_xsim_mu, pop_size_target_offspring):
-        # mating_type: one string applied to both traits, or a (trait1, trait2) pair for per-trait assortment
+        # Mates assort on the latent mating phenotype: self.mating_paths weights if set, otherwise the
+        # mating_type preset (one string for both traits, or a (trait1, trait2) pair)
         ancestor_id_cols = ['Father.ID', 'Mother.ID', 'Fathers.Father.ID', 'Fathers.Mother.ID', 'Mothers.Father.ID', 'Mothers.Mother.ID']
-        per_trait = tuple(mating_type) if isinstance(mating_type, (tuple, list)) else (mating_type, mating_type)
-        if len(per_trait) != 2 or any(t not in self._MATING_SOURCES for t in per_trait):
-            raise ValueError(f"Invalid mating_type: {mating_type}")
-        trait_cols = [c.format(i=i) for i, t in zip((1, 2), per_trait) for c in self._MATING_SOURCES[t]]
+        mating_weights = getattr(self, '_mating_weights', None)
+        if mating_weights is None:
+            mating_weights = self._resolve_mating_paths(mating_type)
+        trait_cols = [f"{c}{i}" for i, w in zip((1, 2), mating_weights) for c in w]
         cols = ["ID", "Sex"] + trait_cols + ancestor_id_cols
 
         males_slim = phendata_df_current_gen.loc[phendata_df_current_gen["Sex"]==1, cols].copy()
         females_slim = phendata_df_current_gen.loc[phendata_df_current_gen["Sex"]==0, cols].copy()
         for df in [males_slim, females_slim]:
-            for i, t in zip((1, 2), per_trait):
-                df[f"mating{i}"] = sum(df[c.format(i=i)].astype(float) for c in self._MATING_SOURCES[t])
+            for i, w in zip((1, 2), mating_weights):
+                df[f"mating{i}"] = sum(wc * df[f"{c}{i}"].astype(float) for c, wc in w.items())
 
         nm, nf = len(males_slim), len(females_slim)
         if nm > nf: males_slim = males_slim.sample(n=nf, replace=False)
@@ -353,6 +391,16 @@ class AssortativeMatingSimulation:
         m_full = phendata_df_current_gen.loc[phendata_df_current_gen['ID'].isin(paired_m['ID'])].set_index('ID').loc[paired_m['ID']].reset_index()
         f_full = phendata_df_current_gen.loc[phendata_df_current_gen['ID'].isin(paired_f['ID'])].set_index('ID').loc[paired_f['ID']].reset_index()
 
+        # Record each spouse's latent mating phenotype and the achieved spousal correlation of it
+        # (rows = husband's trait 1/2, columns = wife's trait 1/2)
+        for full, paired in ((m_full, paired_m), (f_full, paired_f)):
+            full['mating.phenotype1'] = paired['mating1'].values; full['mating.phenotype2'] = paired['mating2'].values
+        achieved_corr = np.full((2, 2), np.nan)
+        if len(paired_m) > 1:
+            with np.errstate(divide='ignore', invalid='ignore'):
+                achieved_corr = np.corrcoef(paired_m[['mating1', 'mating2']].values.astype(float),
+                                            paired_f[['mating1', 'mating2']].values.astype(float), rowvar=False)[0:2, 2:4]
+
         n_act = len(m_full)
         if n_act > 0:
             off_counts = np.random.poisson(pop_size_target_offspring/n_act, n_act)
@@ -366,7 +414,7 @@ class AssortativeMatingSimulation:
             m_full['num.offspring'] = off_counts; f_full['num.offspring'] = off_counts
             m_full['Spouse.ID'] = f_full['ID']; f_full['Spouse.ID'] = m_full['ID']
             
-        return {'males.PHENDATA': m_full, 'females.PHENDATA': f_full, 'achieved_spousal_corr': np.eye(2)}
+        return {'males.PHENDATA': m_full, 'females.PHENDATA': f_full, 'achieved_spousal_corr': achieved_corr}
 
     def _compute_raw_heritability(self):
         """
@@ -736,6 +784,7 @@ class AssortativeMatingSimulation:
                 f.write(f"Total Generations Simulated (target): {self.num_generations}\nInitial Population Size: {self.initial_pop_size}\n")
                 if isinstance(self.pop_vector, np.ndarray) and not np.all(self.pop_vector == self.initial_pop_size): f.write(f"Population Size Vector: {self.pop_vector.tolist()}\n")
                 f.write(f"Mating Type: {self.mating_type}\nAvoid Inbreeding: {self.avoid_inbreeding}\nSeed: {self.seed}\n")
+                if self.mating_paths is not None: f.write(f"Mating Paths (latent mating phenotype weights, trait1, trait2): {self._mating_weights}\n")
                 f.write(f"Number of CVs: {self.n_CV_param if self.n_CV_param is not None else len(self.cv_info)}\n")
                 if self.rg_effects_param is not None: f.write(f"rg (effects for CVs): {self.rg_effects_param}\n")
                 if self.maf_min_param is not None: f.write(f"MAF Range: {self.maf_min_param} - {self.maf_max_param} ({self.maf_dist_param})\n")

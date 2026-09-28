@@ -42,6 +42,7 @@ simulation output.
    - [Scenario G — Burn-in without islands (base class)](#scenario-g--burn-in-without-islands-base-class)
    - [Scenario H — Accessing results and post-processing](#scenario-h--accessing-results-and-post-processing)
    - [Scenario I — mtDNA maternal effects](#scenario-i--mtdna-maternal-effects)
+   - [Scenario J — Latent mating phenotype (genetic / social homogamy)](#scenario-j--latent-mating-phenotype-genetic--social-homogamy)
 8. [Matrix Construction Guide](#8-matrix-construction-guide)
 9. [FAQ / Gotchas](#9-faq--gotchas)
 10. [relationship_finder.py Reference](#10-relationship_finderpy-reference)
@@ -205,10 +206,37 @@ from core_simulation import AssortativeMatingSimulation
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `mating_type` | str or (str, str) | `"phenotypic"` | `"phenotypic"` (mate on `Y`), `"social"` (mate on `F + E`), or `"genotypic"` (mate on `AO + AL`). A `(trait1, trait2)` pair assorts each trait on a different component, e.g. `("genotypic", "social")` |
+| `mating_type` | str or (str, str) | `"phenotypic"` | Preset latent mating phenotype: `"phenotypic"` (mate on `Y`), `"social"` (mate on `F + E`), or `"genotypic"` (mate on `AO + AL`). A `(trait1, trait2)` pair assorts each trait on a different component, e.g. `("genotypic", "social")`. Ignored when `mating_paths` is set |
+| `mating_paths` | dict, (dict/str, dict/str), or None | `None` | Weights defining the latent mating phenotype γ̃ (see [Latent mating phenotype](#latent-mating-phenotype-cascade-am)). A dict of component weights over `AO`, `AL`, `F`, `MT`, `E` applies to both traits; a `(trait1, trait2)` pair gives per-trait weights (each entry a dict or a preset name). Omitted components get weight 0. `None` = use `mating_type` |
 | `avoid_inbreeding` | bool | `True` | Exclude first-degree relatives from pairing |
-| `am_list` | list | required | Per-generation assortative mating target. If `mate_on_trait` is set: list of floats (scalar correlation). If not set: list of 2×2 numpy arrays (cross-trait mating correlation matrix). Length must equal `num_generations` |
+| `am_list` | list | required | Per-generation assortative mating target: the spousal correlation of the latent mating phenotype. If `mate_on_trait` is set: list of floats (scalar correlation). If not set: list of 2×2 numpy arrays (cross-trait mating correlation matrix). Length must equal `num_generations` |
 | `mate_on_trait` | int or None | `None` | `1` or `2` = single-trait AM mode (scalar `am_list`). `None` = two-trait AM mode (matrix `am_list`) |
+
+#### Latent mating phenotype (Cascade AM)
+
+Mates assort on a latent mating phenotype rather than on `Y` directly, following GeneEvolve-ETFD's `am.model` and the SEM-PGS Cascade model. For trait *i*,
+
+$$\tilde\gamma_i = w_{AO}\,AO_i + w_{AL}\,AL_i + w_F\,F_i + w_{MT}\,MT_i + w_E\,E_i$$
+
+Each component is already on the `Y` scale. A weight of 1 means the component enters mate choice exactly as it enters `Y`, and 0 means it plays no role. Fractional weights are allowed, as in GeneEvolve's `am.model` (e.g. `.5` on A). The loadings are trait-diagonal: trait *i*'s γ̃ uses only trait *i*'s own components. Matching standardises γ̃, so only the relative weights matter. `am_list` is the spousal correlation of γ̃, equivalent to GeneEvolve's `latent.AM` with `mu.constant=FALSE`.
+
+| Mechanism | `mating_paths` | Cascade paths | GeneEvolve `am.model` analogue |
+|-----------|----------------|---------------|---------------------------------|
+| Primary phenotypic AM | `{"AO":1,"AL":1,"F":1,"MT":1,"E":1}` (= `mating_type="phenotypic"`) | ã=a, δ̃=δ, 1̃=1 | `rep(1,14)` |
+| Genetic homogamy | `{"AO":1,"AL":1}` (= `"genotypic"`) | ã=a, δ̃=δ, 1̃=0 | A/AA/D = 1, rest 0 |
+| Social homogamy | `{"F":1,"E":1}` (= `"social"`) | ã=0, δ̃=0, 1̃=1 | `c(0,0,0,1,1,1,1,1,1,1,0,0,0,0)` |
+
+Mapping to the Cascade model:
+- `AO` weight = δ̃/δ (PGS path).
+- `AL` weight = ã/a (latent genetic path).
+- `F` and `E` weights = 1̃. The PDF ties them to a single 1̃; here they can differ, like GeneEvolve's separate F/S/U.
+- `MT` has no Cascade-model counterpart.
+
+Each mates dict in `HISTORY['MATES']` records every spouse's γ̃ as `mating.phenotype1` / `mating.phenotype2`. `achieved_spousal_corr` is the 2×2 husband-by-wife correlation of γ̃ (rows = husband's traits, columns = wife's traits).
+
+The mating presets are bit-for-bit identical to the fixed composites used before `mating_paths` existed. The phenotypic preset uses the `Y` column itself.
+
+`IslandMigrationSimulation` does not support `mating_paths`, because within-island mating is always on `Y`; passing it raises `NotImplementedError`.
 
 #### mtDNA Effects
 
@@ -337,6 +365,8 @@ Inherits everything from `AssortativeMatingSimulation`. All base-class parameter
 **Constraint**: `pop_size` must be divisible by `n_islands * 2`.
 
 **Note**: `mate_on_trait` is set internally from `mating_trait`. Do not pass `mate_on_trait` separately when using `IslandMigrationSimulation`.
+
+**Note**: within-island mating is always on `Y`. `mating_paths` is not supported and raises `NotImplementedError`.
 
 ---
 
@@ -738,6 +768,48 @@ print("MT2 ~ mother Y2 cor:", np.corrcoef(with_mom['MT2'].astype(float),
                                            with_mom['mY2'].astype(float))[0, 1])
 ```
 
+---
+
+### Scenario J — Latent mating phenotype (genetic / social homogamy)
+
+This scenario simulates the SEM-PGS Cascade model: mates assort on a latent mating phenotype γ̃ built from weighted components (see [Latent mating phenotype](#latent-mating-phenotype-cascade-am)). Vertical transmission is left unchanged.
+
+```python
+import numpy as np
+from core_simulation import AssortativeMatingSimulation
+
+N_GEN = 10
+mats = dict(
+    cove_mat=np.diag([0.4, 0.5]), f_mat=np.diag([0.2, 0.15]), s_mat=np.zeros((2, 2)),
+    a_mat=np.diag([np.sqrt(0.2), np.sqrt(0.15)]), d_mat=np.diag([np.sqrt(0.3), np.sqrt(0.25)]),
+    covy_mat=np.eye(2), k2_matrix=np.zeros((2, 2)),
+)
+common = dict(n_CV=2000, rg_effects=0.3, maf_min=0.01, maf_max=0.50,
+              num_generations=N_GEN, pop_size=10000, mate_on_trait=1,
+              am_list=[0.4] * N_GEN, seed=42, **mats)
+
+# Genetic homogamy: gamma~ = AO + AL (a~ = a, delta~ = delta, 1~ = 0)
+gh = AssortativeMatingSimulation(mating_paths={"AO": 1, "AL": 1}, **common).run_simulation()
+
+# Social homogamy: gamma~ = F + E (a~ = 0, delta~ = 0, 1~ = 1)
+sh = AssortativeMatingSimulation(mating_paths={"F": 1, "E": 1}, **common).run_simulation()
+
+# Any intermediate mechanism, e.g. half-weight on the latent genetic part and on E
+mix = AssortativeMatingSimulation(mating_paths={"AO": 1, "AL": 0.5, "F": 1, "E": 0.5}, **common).run_simulation()
+
+# Two-trait mode with a different mechanism per trait (mate_on_trait=None, matrix am_list)
+two = AssortativeMatingSimulation(
+    mating_paths=({"AO": 1, "AL": 1}, "social"),
+    **{**common, "mate_on_trait": None, "am_list": [np.array([[0.4, 0.1], [0.1, 0.3]])] * N_GEN},
+).run_simulation()
+
+# Spousal correlation of gamma~ vs. of Y, for the last mating event
+mates = gh['HISTORY']['MATES'][-1]
+h, w = mates['males.PHENDATA'], mates['females.PHENDATA']
+print("achieved r(gamma~):", mates['achieved_spousal_corr'][0, 0])
+print("r(Y1):", np.corrcoef(h['Y1'].astype(float), w['Y1'].astype(float))[0, 1])
+```
+
 **Combining mtDNA with island stratification** — pass `mt_mat` to `IslandMigrationSimulation` in exactly the same way:
 
 ```python
@@ -868,6 +940,7 @@ m = mates['males.PHENDATA']; f = mates['females.PHENDATA']
 print(np.corrcoef(m['Y1'].values.astype(float),
                   f['Y1'].values.astype(float))[0, 1])
 ```
+The correlation of the latent mating phenotype itself, which is what `am_list` targets, is stored directly as `mates['achieved_spousal_corr']`.
 
 **Q: Can I add a third trait?**  
 A: Not without significant refactoring. The entire codebase is hardwired to a 2-trait model (2×2 matrices, column pairs like `Y1`/`Y2`).
@@ -983,6 +1056,14 @@ python -m pytest tests/test_simulation.py -v
 python tests/test_simulation.py
 ```
 
-Six tests cover: baseline AM (no islands/mtDNA), mtDNA maternal transmission, island migration and
-stratification, islands + mtDNA combined, burn-in behavior, and seed reproducibility. See
+Nine tests cover:
+- baseline AM (no islands/mtDNA);
+- mtDNA maternal transmission;
+- island migration and stratification;
+- islands + mtDNA combined;
+- burn-in behavior;
+- seed reproducibility;
+- `mating_paths` reproducing the `mating_type` presets exactly;
+- genetic and social homogamy via the latent mating phenotype;
+- `mating_paths` validation. See
 `tests/test_simulation.py`'s module docstring for details on each.
