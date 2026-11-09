@@ -14,6 +14,8 @@ IslandMigrationSimulation, covering:
      burn-in, population has had time to evolve
   6. Edge cases — mt_mat off-diagonal raises ValueError; pop_size
      not divisible by n_islands*2 raises ValueError
+  7. Founder variances — d_mat and a_mat set the genetic variance
+  8. Shared family environment — s_mat, one draw per sibship
 
 Run with (from the SimulationFunctions/ directory):
     python tests/test_simulation.py
@@ -531,6 +533,66 @@ def test_reproducibility():
 # Entry point
 # ===========================================================================
 
+def _path_matrices(vg1, vg2=0.5, latent1=0.7, latent2=1.0, s_mat=None):
+    """Matrices built the way the generators build them, from vg and the latent share."""
+    return dict(
+        cove_mat=np.diag([1.0 - vg1, 1.0 - vg2]),
+        f_mat=np.zeros((2, 2)),
+        s_mat=np.zeros((2, 2)) if s_mat is None else np.asarray(s_mat, dtype=float),
+        a_mat=np.diag([np.sqrt(vg1 * latent1), np.sqrt(vg2 * latent2)]),
+        d_mat=np.diag([np.sqrt(vg1 * (1 - latent1)), np.sqrt(vg2 * (1 - latent2))]),
+        covy_mat=np.eye(2),
+        k2_matrix=np.eye(2),
+    )
+
+
+def test_founder_variance_follows_paths():
+    print("\n=== Test: founder variances follow d_mat and a_mat ===")
+    for vg in (0.05, 0.35, 0.80):
+        sim = AssortativeMatingSimulation(
+            n_CV=1000, rg_effects=0.5, maf_min=0.01, maf_max=0.50,
+            num_generations=1, pop_size=20000, mating_type="phenotypic",
+            mate_on_trait=2, am_list=[0.0], seed=7, **_path_matrices(vg),
+        )
+        d = sim.phen_df
+        ao, al = d["AO1"].astype(float), d["AL1"].astype(float)
+        vp = d["Y1"].astype(float).var()
+        vg2 = (d["AO2"].astype(float) + d["AL2"].astype(float)).var()
+        _check(f"vg1={vg}: observed variance = vg * 0.3", abs(ao.var() - vg * 0.3) < 0.02, f"{ao.var():.4f}")
+        _check(f"vg1={vg}: latent variance = vg * 0.7", abs(al.var() - vg * 0.7) < 0.02, f"{al.var():.4f}")
+        _check(f"vg1={vg}: founder phenotypic variance = 1", abs(vp - 1) < 0.04, f"{vp:.4f}")
+        _check(f"vg1={vg}: founder heritability = vg", abs((ao + al).var() / vp - vg) < 0.03, f"{(ao + al).var() / vp:.4f}")
+        _check(f"vg1={vg}: trait 2 genetic variance = vg2", abs(vg2 - 0.5) < 0.02, f"{vg2:.4f}")
+
+
+def test_shared_family_environment():
+    print("\n=== Test: s_mat adds an environment shared by full sibs ===")
+    results = AssortativeMatingSimulation(
+        n_CV=500, rg_effects=0.0, maf_min=0.01, maf_max=0.50,
+        num_generations=2, pop_size=8000, mating_type="phenotypic",
+        mate_on_trait=2, am_list=[0.0, 0.0], seed=11,
+        **_path_matrices(0.35, s_mat=np.full((2, 2), 0.5)),
+    ).run_simulation()
+    founders, offspring = results["HISTORY"]["PHEN"][0], results["HISTORY"]["PHEN"][1]
+    s1, s2 = offspring["S1"].astype(float), offspring["S2"].astype(float)
+    within = offspring.assign(S1=s1).groupby("Father.ID")["S1"].nunique().max()
+    rebuilt = sum(offspring[c].astype(float) for c in ["AO1", "AL1", "F1", "S1", "MT1", "E1"])
+    _check("founders have no shared environment", (founders["S1"].astype(float) == 0).all())
+    _check("founder phenotypic variance stays 1", abs(founders["Y1"].astype(float).var() - 1) < 0.05,
+           f"{founders['Y1'].astype(float).var():.4f}")
+    _check("every sibship has one value", within == 1, f"max distinct values per sibship = {within}")
+    _check("Var(S1) = s11^2 + s12^2", abs(s1.var() - 0.5) < 0.05, f"{s1.var():.4f}")
+    _check("Cov(S1, S2) = s11*s21 + s12*s22", abs(np.cov(s1, s2)[0, 1] - 0.5) < 0.05, f"{np.cov(s1, s2)[0, 1]:.4f}")
+    _check("S1 is part of Y1", np.allclose(rebuilt, offspring["Y1"].astype(float)))
+
+    zero = AssortativeMatingSimulation(
+        n_CV=200, rg_effects=0.0, maf_min=0.01, maf_max=0.50,
+        num_generations=1, pop_size=2000, mating_type="phenotypic",
+        mate_on_trait=2, am_list=[0.0], seed=11, **_path_matrices(0.35),
+    ).run_simulation()["HISTORY"]["PHEN"][1]
+    _check("s_mat = 0 gives S = 0", (zero["S1"].astype(float) == 0).all())
+
+
 def main():
     tests = [
         test_baseline_am,
@@ -539,6 +601,8 @@ def main():
         test_island_plus_mtdna,
         test_burn_in_base,
         test_reproducibility,
+        test_founder_variance_follows_paths,
+        test_shared_family_environment,
     ]
 
     for t in tests:

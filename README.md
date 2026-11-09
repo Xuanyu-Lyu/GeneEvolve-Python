@@ -57,6 +57,7 @@ The simulation tracks two quantitative traits (Trait 1 = study trait, Trait 2 = 
 - **Observed genetic value** (`AO`): the part of the genome captured by measured SNPs
 - **Latent genetic value** (`AL`): the remainder of the genome, unobserved
 - **Vertical transmission** (`F`): parental phenotype → offspring phenotype path
+- **Shared family environment** (`S`): one draw per mating pair, shared by all full siblings
 - **Non-shared environment** (`E`): residual, uncorrelated across family members
 
 The split between observed and latent is governed by masks applied to the causal variant (CV) effect sizes, set implicitly via `d_mat` and `a_mat`.
@@ -65,11 +66,11 @@ The split between observed and latent is governed by masks applied to the causal
 
 ## 2. Phenotype Equation & Variance Components
 
-$$Y = A_O + A_L + F + MT + E$$
+$$Y = A_O + A_L + F + S + MT + E$$
 
 where $MT$ is the maternally inherited mitochondrial DNA (mtDNA) component. It is zero by default (`mt_mat = zeros`). When non-zero, each offspring's $MT$ value is computed from the mother's phenotype via the `mt_mat` path matrix.
 
-At generation 0, variances are set by the matrices supplied to the constructor. After each generation the variance components evolve due to assortment and vertical transmission. `summary_results` tracks empirical covariance matrices each generation.
+At generation 0, variances are set by the matrices supplied to the constructor: `d_mat` and `a_mat` scale the effect sizes (when effects are generated from `n_CV`; a `cv_info` table is used as given) and `cove_mat` sets $E$. After each generation the variance components evolve due to assortment and vertical transmission. `summary_results` tracks empirical covariance matrices each generation.
 
 **Heritability decomposition**
 
@@ -95,6 +96,7 @@ Every individual row in `phen_df` (and in `history['PHEN'][gen]`) contains:
 | `AO1`, `AO2` | Observed genetic value, traits 1 & 2 |
 | `AL1`, `AL2` | Latent genetic value, traits 1 & 2 |
 | `F1`, `F2` | Vertical transmission component |
+| `S1`, `S2` | Shared family environment (zero in founders and when `s_mat` is zero) |
 | `MT1`, `MT2` | mtDNA maternal transmission component (zero when `mt_mat` is not set) |
 | `E1`, `E2` | Non-shared environment |
 | `Y1`, `Y2` | Total phenotype |
@@ -169,7 +171,7 @@ cv_df = AssortativeMatingSimulation.prepare_CV_random_selection(
 # Returns DataFrame with columns: maf, alpha1, alpha2, mask_obs1, mask_obs2
 ```
 
-Pass the result as `cv_info=cv_df` to fix CVs across replicate runs.
+Pass the result as `cv_info=cv_df` to fix CVs across replicate runs. A table passed this way is used as given. To set its founder variances from the path matrices first, call `AssortativeMatingSimulation.scale_effects_to_paths(cv_df, d_mat, a_mat)`.
 
 ---
 
@@ -237,10 +239,10 @@ All matrices are 2×2 (one row/column per trait) unless noted.
 |--------|-----------|-------------|
 | `cove_mat` | `cove_mat` | Covariance matrix of the environment term **E** |
 | `f_mat` | `f_mat` | Vertical transmission matrix. `f_mat[i,j]` = path from parent trait j to offspring F component i |
-| `s_mat` | `s_mat` | Shared-environment / social-homogamy path matrix. **Currently not applied by the simulation engine** — it is stored and written to the summary file only. Pass a zeros matrix. |
-| `a_mat` | `a_mat` | Latent genetic path matrix. Used to derive the observed/latent SNP split |
-| `d_mat` | `d_mat` | Observed genetic path matrix (same interpretation as `a_mat` for observed SNPs) |
-| `covy_mat` | `covy_mat` | Target phenotypic covariance matrix (used to scale/validate the setup) |
+| `s_mat` | `s_mat` | Shared-environment path matrix. Each mating pair gets one draw $S = \text{s\_mat}\, z$, $z \sim N(0, I_2)$, shared by all its offspring, so $\mathrm{Cov}(S) = \text{s\_mat}\,\text{s\_mat}^\top$. Founders have no `S`. A zeros matrix turns it off |
+| `a_mat` | `a_mat` | Latent genetic path matrix. Sets the observed/latent SNP split and scales the latent effects: founder $V_{AL,i} = \sum_k$ `a_mat[i,k]`$^2$ |
+| `d_mat` | `d_mat` | Observed genetic path matrix. Scales the observed effects in the same way: founder $V_{AO,i} = \sum_k$ `d_mat[i,k]`$^2$ |
+| `covy_mat` | `covy_mat` | Target phenotypic covariance matrix. Stored and written to the summary file only |
 | `k2_matrix` | `k2_matrix` | Genetic-relatedness (K2) matrix. **Not applied inside the simulation loop** — genetic covariance is built from `d_mat` / `a_mat` during condition setup; this value is stored and written to the summary file only. |
 | `mt_mat` | `mt_mat` | Diagonal 2×2 mtDNA path matrix. `mt_mat[i,i]` = path from mother's $Y_i$ to offspring's $MT_i$. **Must be diagonal** (no cross-trait effects). Default: `None` (treated as zero matrix) |
 
@@ -295,7 +297,7 @@ Override these in subclasses to extend behaviour without duplicating the loop.
 | `GEN_ABS` | 0-based absolute generation (includes burn-in offset) |
 | `POPSIZE` | Number of individuals |
 | `MATE.COR` | AM correlation used for the *next* generation (look-ahead) |
-| `VAO`, `VAL`, `VF`, `VE`, `VP` | 2×2 covariance matrices for each component |
+| `VAO`, `VAL`, `VF`, `VS`, `VE`, `VP` | 2×2 covariance matrices for each component |
 | `VMT` | 2×2 covariance matrix for the mtDNA component |
 | `h2`, `h2.obs`, `h2.lat` | Two-element lists `[trait1, trait2]` |
 | `h2.mt` | Two-element list `[trait1, trait2]` — $V_{MT} / V_P$ per trait |

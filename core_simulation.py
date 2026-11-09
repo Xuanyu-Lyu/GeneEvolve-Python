@@ -140,8 +140,32 @@ class AssortativeMatingSimulation:
             "mask_obs2": mask2
         })
         
-    def __init__(self, 
-                 cv_info=None, 
+    @staticmethod
+    def scale_effects_to_paths(cv_info, d_mat, a_mat):
+        """
+        Rescale the effect sizes so the founders' genetic variances equal the path matrices.
+
+        For trait i, the observed variants are scaled to a variance of sum(d_mat[i, :]**2) and
+        the latent variants to sum(a_mat[i, :]**2), using the Hardy-Weinberg variance 2pq of each
+        variant. With d_mat and a_mat built from vg, the founder genetic variance is vg.
+        """
+        scaled = cv_info.copy()
+        het = 2 * scaled["maf"].to_numpy(float) * (1 - scaled["maf"].to_numpy(float))
+        for i, (alpha_col, mask_col) in enumerate([("alpha1", "mask_obs1"), ("alpha2", "mask_obs2")]):
+            alpha = scaled[alpha_col].to_numpy(float)
+            mask = scaled[mask_col].to_numpy() == 1
+            for paths, members in ((d_mat, mask), (a_mat, ~mask)):
+                target = float(np.sum(paths[i] ** 2))
+                current = float(np.sum(het[members] * alpha[members] ** 2))
+                if target > 0 and current == 0:
+                    raise ValueError(f"Trait {i + 1} needs genetic variance {target:.4g} from a set of "
+                                     "variants that is empty; increase n_CV.")
+                alpha[members] *= np.sqrt(target / current) if current > 0 else 0.0
+            scaled[alpha_col] = alpha
+        return scaled
+
+    def __init__(self,
+                 cv_info=None,
                  n_CV=None, rg_effects=None, maf_min=None, maf_max=None, maf_dist="uniform",
                  # h2_targets removed per request
                  num_generations=None, pop_size=None, mating_type="phenotypic", avoid_inbreeding=True,
@@ -191,6 +215,8 @@ class AssortativeMatingSimulation:
             self.cv_info = AssortativeMatingSimulation.prepare_CV_random_selection(
                 n_CV, rg_effects, maf_min, maf_max, prop1, prop2, maf_dist
             )
+            if d_mat is not None and a_mat is not None:
+                self.cv_info = AssortativeMatingSimulation.scale_effects_to_paths(self.cv_info, d_arr, a_arr)
             
             self.n_CV_param = n_CV; self.rg_effects_param = rg_effects
             self.maf_min_param = maf_min; self.maf_max_param = maf_max; self.maf_dist_param = maf_dist
@@ -250,7 +276,7 @@ class AssortativeMatingSimulation:
         self.phen_df, self.xo, self.xl = None, None, None
         self.summary_results = []; self.history = {'MATES': [], 'PHEN': [], 'XO': [], 'XL': []} if self.save_each_gen else None; self.covariances_log = [] if self.save_covs else None
         
-        self.phen_column_names = ["ID", "Father.ID", "Mother.ID", "Fathers.Father.ID", "Fathers.Mother.ID", "Mothers.Father.ID", "Mothers.Mother.ID", "Sex", "AO_std1", "AO_std2", "AL_std1", "AL_std2", "AO1", "AO2", "AL1", "AL2", "F1", "F2", "MT1", "MT2", "E1", "E2", "Y1", "Y2", "Y1P", "Y2P", "Y1M", "Y2M", "F1P", "F2P", "F1M", "F2M", "TPO1", "TPO2", "TMO1", "TMO2", "NTPO1", "NTPO2", "NTMO1", "NTMO2", "TPL1", "TPL2", "TML1", "TML2", "NTPL1", "NTPL2", "NTML1", "NTML2"]
+        self.phen_column_names = ["ID", "Father.ID", "Mother.ID", "Fathers.Father.ID", "Fathers.Mother.ID", "Mothers.Father.ID", "Mothers.Mother.ID", "Sex", "AO_std1", "AO_std2", "AL_std1", "AL_std2", "AO1", "AO2", "AL1", "AL2", "F1", "F2", "S1", "S2", "MT1", "MT2", "E1", "E2", "Y1", "Y2", "Y1P", "Y2P", "Y1M", "Y2M", "F1P", "F2P", "F1M", "F2M", "TPO1", "TPO2", "TMO1", "TMO2", "NTPO1", "NTPO2", "NTMO1", "NTMO2", "TPL1", "TPL2", "TML1", "TML2", "NTPL1", "NTPL2", "NTML1", "NTML2"]
         
         self._initialize_generation_zero()
 
@@ -298,7 +324,7 @@ class AssortativeMatingSimulation:
         final = np.full(n_targets, -1, dtype=int); final = new_closest_indices[np.argsort(rand_index_cols)]
         return final
 
-    _MATING_SOURCES = {"phenotypic": ("Y{i}",), "social": ("F{i}", "E{i}"), "genotypic": ("AO{i}", "AL{i}")}
+    _MATING_SOURCES = {"phenotypic": ("Y{i}",), "social": ("F{i}", "S{i}", "E{i}"), "genotypic": ("AO{i}", "AL{i}")}
 
     def _assort_mate(self, phendata_df_current_gen, mating_type, pheno_mate_corr_target_xsim_mu, pop_size_target_offspring):
         # mating_type: one string applied to both traits, or a (trait1, trait2) pair for per-trait assortment
@@ -485,9 +511,16 @@ class AssortativeMatingSimulation:
         f_y = (fathers[['Y1','Y2']].values @ self.f_mat.T) + (mothers[['Y1','Y2']].values @ self.f_mat.T)
         mt_y = mothers[['Y1','Y2']].values @ self.mt_mat.T
         e_new = np.random.multivariate_normal(np.zeros(2), self.cove_mat, size=total)
-        
-        # Y = AO + AL + F + MT + E
-        y_new = ao_new_raw + al_new_raw + f_y + mt_y + e_new
+
+        # Shared family environment: one draw per mating pair, so full sibs share it.
+        # Cov(S) = s_mat @ s_mat.T; nothing is drawn when s_mat is zero.
+        s_y = np.zeros((total, 2))
+        if self.s_mat is not None and np.any(self.s_mat):
+            family_draws = np.random.standard_normal(size=(len(m_idx), 2)) @ self.s_mat.T
+            s_y = family_draws[idx_rep_m]
+
+        # Y = AO + AL + F + S + MT + E
+        y_new = ao_new_raw + al_new_raw + f_y + s_y + mt_y + e_new
 
         new_df = pd.DataFrame(index=np.arange(total), columns=self.phen_column_names)
         max_id = phendata_parent_gen_df_full['ID'].max()
@@ -496,7 +529,7 @@ class AssortativeMatingSimulation:
         new_df['Sex'] = np.random.permutation(np.concatenate([np.zeros(total//2), np.ones(total-total//2)]))
         
         new_df[['AO1','AO2']] = ao_new_raw; new_df[['AL1','AL2']] = al_new_raw
-        new_df[['F1','F2']] = f_y; new_df[['MT1','MT2']] = mt_y
+        new_df[['F1','F2']] = f_y; new_df[['S1','S2']] = s_y; new_df[['MT1','MT2']] = mt_y
         new_df[['E1','E2']] = e_new; new_df[['Y1','Y2']] = y_new
         
         new_df['TPO1'] = tpo1; new_df['TPO2'] = tpo2
@@ -531,7 +564,7 @@ class AssortativeMatingSimulation:
         self.phen_df['ID'] = np.arange(1000000, 1000000+n_pop)
         self.phen_df['Sex'] = np.random.permutation(np.concatenate([np.zeros(n_pop//2), np.ones(n_pop-n_pop//2)]))
         self.phen_df[['AO1','AO2']] = ao_raw; self.phen_df[['AL1','AL2']] = al_raw
-        self.phen_df[['F1','F2']] = f_gen0; self.phen_df[['MT1','MT2']] = mt_gen0
+        self.phen_df[['F1','F2']] = f_gen0; self.phen_df[['S1','S2']] = np.zeros((n_pop, 2)); self.phen_df[['MT1','MT2']] = mt_gen0
         self.phen_df[['E1','E2']] = e_gen0; self.phen_df[['Y1','Y2']] = y_gen0
         for c in self.phen_column_names:
             if c not in self.phen_df.columns: self.phen_df[c] = np.nan
@@ -616,7 +649,7 @@ class AssortativeMatingSimulation:
             temp_phen_df_for_cov["BV.NT.O1"] = temp_phen_df_for_cov["NTPO1"] + temp_phen_df_for_cov["NTMO1"]
             temp_phen_df_for_cov["BV.NT.O2"] = temp_phen_df_for_cov["NTPO2"] + temp_phen_df_for_cov["NTMO2"]
 
-        cols_for_full_cov_calc = ['TPO1','TMO1','NTPO1','NTMO1','TPL1','TML1','NTPL1','NTML1','TPO2','TMO2','NTPO2','NTMO2','TPL2','TML2','NTPL2','NTML2','AO1','AO2','AL1','AL2','F1','F2','E1','E2',"BV.NT.O1","BV.NT.O2",'Y1','Y2','Y1P','Y2P','Y1M','Y2M','F1P','F2P','F1M','F2M']
+        cols_for_full_cov_calc = ['TPO1','TMO1','NTPO1','NTMO1','TPL1','TML1','NTPL1','NTML1','TPO2','TMO2','NTPO2','NTMO2','TPL2','TML2','NTPL2','NTML2','AO1','AO2','AL1','AL2','F1','F2','S1','S2','E1','E2',"BV.NT.O1","BV.NT.O2",'Y1','Y2','Y1P','Y2P','Y1M','Y2M','F1P','F2P','F1M','F2M']
         valid_cols = [col for col in cols_for_full_cov_calc if col in temp_phen_df_for_cov.columns]
         full_cov_df = pd.DataFrame()
         if len(valid_cols) > 1:
@@ -645,7 +678,7 @@ class AssortativeMatingSimulation:
         }
         for comp_name, cols in {
             "VAO": ["AO1", "AO2"], "VAL": ["AL1", "AL2"],
-            "VF":  ["F1",  "F2"],  "VMT": ["MT1", "MT2"],
+            "VF":  ["F1",  "F2"],  "VS":  ["S1",  "S2"],  "VMT": ["MT1", "MT2"],
             "VE":  ["E1",  "E2"],  "VP":  ["Y1",  "Y2"]
         }.items():
             if all(c in self.phen_df.columns for c in cols):
@@ -688,7 +721,7 @@ class AssortativeMatingSimulation:
         s.append(f"Population Size: {gen_summary_dict.get('POPSIZE', 'N/A')}")
         s.append(f"Mating Correlation (mu for these parents): {self._format_matrix_for_file(gen_summary_dict.get('MATE.COR', 'N/A'))}")
         s.append("\nVariance Components (for Y-scaled values):")
-        for key in ['VAO', 'VAL', 'VF', 'VMT', 'VE', 'VP']:
+        for key in ['VAO', 'VAL', 'VF', 'VS', 'VMT', 'VE', 'VP']:
             s.append(f"  {key}: {self._format_matrix_for_file(gen_summary_dict.get(key, 'N/A'))}")
         s.append("\nHeritabilities:")
         for key in ['h2', 'h2.obs', 'h2.lat', 'h2.mt', 'h2.raw']:
